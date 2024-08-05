@@ -16,33 +16,114 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ev.h>
+#include <json-c/json.h>
 #include <obs-module.h>
-#include <plugin-support.h>
+#include <obs-frontend.h>
 
-OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+#define PORT 63515
 
-bool obs_module_load(void)
-{
-	bool recording = obs_get_recording_status();
-	bool streaming = obs_get_streaming_status();
+struct http_server {
+    struct ev_loop *loop;
+    int listen_fd;
+    json_object *data;
+};
 
-	json_t *root = json_object();
-	json_object_set_new(root, "recording", json_boolean(recording));
-	json_object_set_new(root, "streaming", json_boolean(streaming));
+static struct http_server *server;
 
-	http_server_t *server = http_server_create("localhost", 63515);
-	http_server_set_response(server, json_dumps(root, 0));
-
-	http_server_start(server);
-
-	json_decref(root);
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
-	return true;
+static void update_json_data() {
+    json_object_object_add(server->data, "streaming", json_object_new_string(obs_frontend_streaming_active() ? "on" : "off"));
+    json_object_object_add(server->data, "recording", json_object_new_string(obs_frontend_recording_active() ? "on" : "off"));
 }
 
-void obs_module_unload(void)
-{
-	http_server_stop();
-	obs_log(LOG_INFO, "plugin unloaded");
+static void http_cb(struct ev_io *w, int revents) {
+    int client_fd;
+    struct sockaddr_in client_addr;
+    socklen_t addrlen = sizeof(client_addr);
+
+    client_fd = accept(w->fd, (struct sockaddr *)&client_addr, &addrlen);
+    if (client_fd < 0) {
+        perror("accept");
+        return;
+    }
+
+    // Create a new event watcher for the client socket
+    struct ev_io client_watcher;
+    ev_io_init(&client_watcher, client_cb, client_fd, EV_READ);
+    ev_io_start(server->loop, &client_watcher);
+}
+
+static void client_cb(struct ev_io *w, int revents) {
+    char buffer[1024];
+    int bytes_read = recv(w->fd, buffer, sizeof(buffer), 0);
+    if (bytes_read <= 0) {
+        // Handle connection closure
+        ev_io_stop(server->loop, w);
+        close(w->fd);
+        return;
+    }
+
+    // Parse HTTP request (simplified)
+    char *request_path = strchr(buffer, ' ') + 1;
+    request_path = strchr(request_path, '/') + 1;
+    char *end = strchr(request_path, ' ');
+    if (end) {
+        *end = '\0';
+    }
+
+    // Generate HTTP response
+    char response[1024];
+    update_json_data(); // Update JSON data before sending response
+    sprintf(response, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", json_object_to_json_string(server->data));
+
+    send(w->fd, response, strlen(response), 0);
+}
+
+bool obs_module_load(void) {
+    server = calloc(1, sizeof(*server));
+    server->loop = ev_default_loop(0);
+
+    int server_socket;
+    struct sockaddr_in server_addr;
+
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket < 0) {
+        perror("Error creating socket");
+        exit(1);
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Error binding socket");
+        exit(1);
+    }
+
+    listen(server_socket, 5);
+
+    struct ev_io watcher;
+    ev_io_init(&watcher, http_cb, server_socket, EV_READ);
+    ev_io_start(server->loop, &watcher);
+
+    server->data = json_object_new_object();
+    update_json_data(); // Initialize JSON data
+
+    return true;
+}
+
+void obs_module_unload(void) {
+    ev_break(server->loop, EVBREAK_ALL);
+    ev_loop_destroy(server->loop);
+    json_object_put(server->data);
+    free(server);
 }
