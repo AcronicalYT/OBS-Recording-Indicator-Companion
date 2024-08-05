@@ -20,7 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <sys/socket.h>
+#include <winsock2.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ev.h>
